@@ -255,6 +255,158 @@ def _stack_var(
 
 
 # ----------------------------#
+# TKE budget 工具
+# ----------------------------#
+
+
+def extract_field(dataset: Optional[xr.Dataset], var_name: str) -> Optional[xr.DataArray]:
+    """返回用于 TKE budget 的 (z, time) DataArray。"""
+    if dataset is None:
+        return None
+    if var_name not in dataset:
+        return None
+    field = dataset[var_name]
+    z_dim = "zi" if "zi" in field.dims else ("z" if "z" in field.dims else None)
+    if z_dim is None:
+        raise ValueError(f"Cannot identify vertical dimension for '{var_name}'")
+    t_dim = "time" if "time" in field.dims else None
+    if t_dim is None:
+        raise ValueError(f"Cannot identify time dimension for '{var_name}'")
+    for dim in list(field.dims):
+        if dim not in (z_dim, t_dim):
+            field = field.mean(dim=dim, keep_attrs=True)
+    if z_dim == "zi" and "z" in getattr(dataset, "coords", {}):
+        field = field.interp(zi=dataset.coords["z"], method="linear")
+        z_dim = "z"
+    return field.transpose(z_dim, t_dim)
+
+
+def compute_stokes_drift(
+    z_vals: xr.DataArray,
+    *,
+    H_stokes: float = 30.0,
+    amplitude: float = 1.0,
+    wavelength: float = 60.0,
+    g: float = 9.81,
+) -> Tuple[np.ndarray, np.ndarray]:
+    wavenumber = 2 * np.pi / wavelength
+    frequency = np.sqrt(g * wavenumber * np.tanh(wavenumber * H_stokes))
+    Us_param = amplitude**2 * wavenumber * frequency
+    denom = np.sinh(wavenumber * H_stokes) ** 2
+    arg = 2 * wavenumber * (z_vals + H_stokes)
+    Us_vals = (Us_param * np.cosh(arg)) / (2 * denom)
+    dUsdz_vals = (Us_param * wavenumber * np.sinh(arg)) / denom
+    return Us_vals, dUsdz_vals
+
+
+def _shear_production(
+    wu: Optional[xr.DataArray],
+    wv: Optional[xr.DataArray],
+    u_field: Optional[xr.DataArray],
+    v_field: Optional[xr.DataArray],
+) -> Optional[xr.DataArray]:
+    if wu is None or u_field is None:
+        return None
+    z_dim = u_field.dims[0]
+    term = -wu * u_field.differentiate(z_dim)
+    if wv is not None and v_field is not None:
+        v_dim = v_field.dims[0]
+        term = term - wv * v_field.differentiate(v_dim)
+    else:
+        warnings.warn("缺少 wv 或 v 字段，仅使用 u 分量计算剪切生产项。")
+    return term
+
+
+def compute_tke_budget(
+    dataset: Optional[xr.Dataset],
+    *,
+    include_stokes: bool = True,
+    stokes_params: Optional[Dict[str, float]] = None,
+) -> Dict[str, xr.DataArray]:
+    """计算 TKE budget 各项并返回字段字典。"""
+    results: Dict[str, xr.DataArray] = {}
+    if dataset is None:
+        return results
+
+    e = extract_field(dataset, "e")
+    if e is not None:
+        results["e"] = e
+
+    tke_dissipation = extract_field(dataset, "tke_dissipation")
+    if tke_dissipation is not None:
+        results["tke_dissipation"] = tke_dissipation
+
+    tke_advective_flux = extract_field(dataset, "tke_advective_flux")
+    tke_pressure_flux = extract_field(dataset, "tke_pressure_flux")
+    tke_transport = (
+        -tke_advective_flux - tke_pressure_flux
+        if (tke_advective_flux is not None and tke_pressure_flux is not None)
+        else None
+    )
+    if tke_transport is not None:
+        results["tke_transport"] = tke_transport
+
+    tke_buoyancy_flux = extract_field(dataset, "tke_buoyancy_flux")
+    if tke_buoyancy_flux is not None:
+        results["tke_buoyancy_flux"] = tke_buoyancy_flux
+
+    u_lagrangian = extract_field(dataset, "u")
+    v_lagrangian = extract_field(dataset, "v")
+
+    wu = extract_field(dataset, "wu")
+    if wu is not None:
+        results["wu"] = wu
+    wv = extract_field(dataset, "wv")
+    if wv is not None:
+        results["wv"] = wv
+
+    tke_shear_production = None
+    tke_stokes_production = None
+
+    if include_stokes and u_lagrangian is not None:
+        params = stokes_params or {}
+        z_dim = u_lagrangian.dims[0]
+        z_vals = u_lagrangian[z_dim]
+        Us_vals, dUsdz_vals = compute_stokes_drift(z_vals, **params)
+        Us_field = xr.DataArray(Us_vals, coords={z_dim: z_vals}, dims=z_dim).broadcast_like(u_lagrangian)
+        dUsdz_field = xr.DataArray(dUsdz_vals, coords={z_dim: z_vals}, dims=z_dim).broadcast_like(u_lagrangian)
+
+        u_eulerian = u_lagrangian - Us_field
+        v_eulerian = v_lagrangian
+        tke_shear_production = _shear_production(wu, wv, u_eulerian, v_eulerian)
+        if tke_shear_production is not None:
+            results["tke_shear_production_eulerian"] = tke_shear_production
+
+        if wu is not None:
+            tke_stokes_production = -wu * dUsdz_field
+            results["tke_stokes_production"] = tke_stokes_production
+    else:
+        tke_shear_production = _shear_production(wu, wv, u_lagrangian, v_lagrangian)
+        if tke_shear_production is not None:
+            results["tke_shear_production_lagrangian"] = tke_shear_production
+
+    rhs_terms = []
+    if tke_shear_production is not None:
+        rhs_terms.append(tke_shear_production)
+    if tke_stokes_production is not None:
+        rhs_terms.append(tke_stokes_production)
+    if tke_dissipation is not None:
+        rhs_terms.append(-tke_dissipation)
+    if tke_transport is not None:
+        rhs_terms.append(tke_transport)
+    if tke_buoyancy_flux is not None:
+        rhs_terms.append(tke_buoyancy_flux)
+
+    if rhs_terms:
+        rhs = rhs_terms[0]
+        for term in rhs_terms[1:]:
+            rhs = rhs + term
+        results["tke_residual"] = rhs
+
+    return results
+
+
+# ----------------------------#
 # 公共 API
 # ----------------------------#
 
